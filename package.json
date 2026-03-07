@@ -1,0 +1,14 @@
+
+{
+  "name": "delete-staff",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "build": "echo \"no build step\"",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-appwrite": "^13.0.0"
+  }
+}
