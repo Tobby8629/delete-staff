@@ -112,6 +112,7 @@
 // };
 
 
+
 import {
   Client,
   Users,
@@ -122,16 +123,23 @@ import {
 
 export default async ({ req, res, error }) => {
   try {
+    const body =
+      typeof req.body === "string"
+        ? JSON.parse(req.body || "{}")
+        : req.body || {};
+
     const {
       staffId,
       userId,
-    } = JSON.parse(req.body);
+      actorUserId,
+    } = body;
 
-    if (!staffId || !userId) {
+    if (!staffId || !userId || !actorUserId) {
       return res.json(
         {
           success: false,
-          message: "staffId and userId are required",
+          message:
+            "staffId, userId and actorUserId are required",
         },
         400
       );
@@ -152,27 +160,30 @@ export default async ({ req, res, error }) => {
       process.env.APPWRITE_STAFF_COLLECTION_ID;
 
     const assignmentCollectionId =
-      process.env.APPWRITE_STAFF_SHIFT_ASSIGNMENT_COLLECTION_ID;
+      process.env
+        .APPWRITE_STAFF_SHIFT_ASSIGNMENT_COLLECTION_ID;
 
     const openShiftCollectionId =
       process.env.APPWRITE_OPEN_SHIFT_COLLECTION_ID;
 
-    /**
-     * YYYY-MM-DD in facility/local timezone.
-     *
-     * If your scheduling timezone is important,
-     * you can later replace this with Luxon.
-     */
-    const now = new Date();
+    if (
+      !databaseId ||
+      !staffCollectionId ||
+      !assignmentCollectionId ||
+      !openShiftCollectionId
+    ) {
+      return res.json(
+        {
+          success: false,
+          message:
+            "Required environment variables are missing",
+        },
+        500
+      );
+    }
 
-    const todayYMD = [
-      now.getFullYear(),
-      String(now.getMonth() + 1).padStart(2, "0"),
-      String(now.getDate()).padStart(2, "0"),
-    ].join("-");
-
     /**
-     * 1. Make sure staff exists.
+     * Check staff exists.
      */
     let staff;
 
@@ -197,88 +208,215 @@ export default async ({ req, res, error }) => {
     }
 
     /**
-     * 2. Find this staff member's current/future assignments.
+     * Current date YYYY-MM-DD.
      */
-    const assignmentResult =
-      await databases.listDocuments(
-        databaseId,
-        assignmentCollectionId,
-        [
-          Query.equal("staffId", staffId),
-          Query.greaterThanEqual(
-            "dateYMD",
-            todayYMD
-          ),
-          Query.limit(100),
-        ]
-      );
+    const now = new Date();
 
-    const assignments =
-      assignmentResult.documents || [];
-
-    const convertedToOpenShift = [];
-    const deletedAssignments = [];
-    const failedAssignments = [];
+    const todayYMD = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    ].join("-");
 
     /**
-     * 3. Convert each future assignment
-     * into an open shift.
+     * Get ALL current/future assignments.
      */
-    for (const assignment of assignments) {
-      try {
-        /**
-         * Create open shift.
-         *
-         * Adjust these fields to match
-         * YOUR open_shift collection.
-         */
+    const assignments = [];
+    let cursor = null;
+
+    while (true) {
+      const queries = [
+        Query.equal("staffId", staffId),
+        Query.greaterThanEqual(
+          "dateYMD",
+          todayYMD
+        ),
+        Query.orderAsc("$id"),
+        Query.limit(100),
+      ];
+
+      if (cursor) {
+        queries.push(
+          Query.cursorAfter(cursor)
+        );
+      }
+
+      const result =
+        await databases.listDocuments(
+          databaseId,
+          assignmentCollectionId,
+          queries
+        );
+
+      assignments.push(
+        ...result.documents
+      );
+
+      if (
+        result.documents.length < 100
+      ) {
+        break;
+      }
+
+      cursor =
+        result.documents[
+          result.documents.length - 1
+        ].$id;
+    }
+
+    /**
+     * Validate ALL assignments before making
+     * any database changes.
+     */
+    const invalidAssignments =
+      assignments.filter(
+        (assignment) =>
+          !assignment.shiftId ||
+          !assignment.date ||
+          !assignment.dateYMD ||
+          !assignment.departmentId
+      );
+
+    if (invalidAssignments.length > 0) {
+      return res.json(
+        {
+          success: false,
+          message:
+            "Some future assignments are missing required information.",
+          data: {
+            invalidAssignments:
+              invalidAssignments.map(
+                (item) => ({
+                  assignmentId:
+                    item.$id,
+
+                  shiftId:
+                    item.shiftId || null,
+
+                  date:
+                    item.date || null,
+
+                  dateYMD:
+                    item.dateYMD || null,
+
+                  departmentId:
+                    item.departmentId ||
+                    null,
+                })
+              ),
+          },
+        },
+        409
+      );
+    }
+
+    const createdOpenShifts = [];
+    const deletedAssignments = [];
+
+    /**
+     * Create open shifts first.
+     */
+    try {
+      for (const assignment of assignments) {
         const openShift =
           await databases.createDocument(
             databaseId,
             openShiftCollectionId,
             ID.unique(),
             {
-              shiftId:
-                assignment.shiftId,
+              /**
+               * Admin/system actor who caused
+               * the open shift to be created.
+               */
+              createdBy:
+                actorUserId,
 
-              dateYMD:
-                assignment.dateYMD,
+              totalOpenings:
+                1,
 
-              date:
-                assignment.date,
+              filledCount:
+                0,
 
-              unitId:
-                assignment.unitId,
+              allowAvailabilityList:
+                true,
+
+              /**
+               * Must exactly match your
+               * Appwrite enum value.
+               */
+              status:
+                "open",
 
               departmentId:
                 assignment.departmentId,
 
-              status:
-                "open",
+              unitId:
+                assignment.unitId || null,
 
-              source:
-                "staff_deleted",
+              shiftId:
+                assignment.shiftId,
 
-              originalAssignmentId:
-                assignment.$id,
+              date:
+                assignment.date,
 
-              originalStaffId:
-                staffId,
+              dateYMD:
+                assignment.dateYMD,
 
-              createdAt:
-                new Date().toISOString(),
+              requiresLead:
+                false,
+
+              notes:
+                "Automatically opened because assigned staff was permanently deleted",
             }
           );
 
-        convertedToOpenShift.push(
-          openShift.$id
-        );
+        createdOpenShifts.push({
+          openShiftId:
+            openShift.$id,
 
-        /**
-         * 4. Remove original staff assignment
-         * after the open shift has successfully
-         * been created.
-         */
+          assignmentId:
+            assignment.$id,
+        });
+      }
+    } catch (createError) {
+      /**
+       * Roll back open shifts already created.
+       */
+      for (
+        const created of
+        createdOpenShifts
+      ) {
+        try {
+          await databases.deleteDocument(
+            databaseId,
+            openShiftCollectionId,
+            created.openShiftId
+          );
+        } catch {
+          // Ignore rollback failure here.
+        }
+      }
+
+      return res.json(
+        {
+          success: false,
+          message:
+            "Failed to convert future assignments to open shifts. Staff was not deleted.",
+          error:
+            createError?.message ||
+            String(createError),
+        },
+        409
+      );
+    }
+
+    /**
+     * All open shifts were created successfully.
+     *
+     * Now remove corresponding assignments.
+     */
+    try {
+      for (const assignment of assignments) {
         await databases.deleteDocument(
           databaseId,
           assignmentCollectionId,
@@ -288,43 +426,30 @@ export default async ({ req, res, error }) => {
         deletedAssignments.push(
           assignment.$id
         );
-      } catch (assignmentError) {
-        failedAssignments.push({
-          assignmentId:
-            assignment.$id,
-
-          message:
-            assignmentError?.message ||
-            "Failed to convert assignment",
-        });
       }
-    }
-
-    /**
-     * If any future assignments could not
-     * be converted, I recommend NOT deleting
-     * the staff member yet.
-     *
-     * Otherwise you could lose staffing data.
-     */
-    if (failedAssignments.length > 0) {
+    } catch (deleteAssignmentError) {
       return res.json(
         {
           success: false,
+          partialSuccess: true,
           message:
-            "Some assigned shifts could not be converted to open shifts. Staff was not deleted.",
+            "Open shifts were created, but one or more original assignments could not be deleted.",
+          error:
+            deleteAssignmentError?.message ||
+            String(
+              deleteAssignmentError
+            ),
           data: {
-            convertedToOpenShift,
+            createdOpenShifts,
             deletedAssignments,
-            failedAssignments,
           },
         },
-        409
+        500
       );
     }
 
     /**
-     * 5. Delete staff database document.
+     * Delete staff document.
      */
     await databases.deleteDocument(
       databaseId,
@@ -333,28 +458,22 @@ export default async ({ req, res, error }) => {
     );
 
     /**
-     * 6. Permanently delete Appwrite auth user.
-     *
-     * Do this last.
+     * Permanently delete Appwrite Auth user.
      */
     try {
       await users.delete(userId);
     } catch (userDeleteError) {
-      /**
-       * At this point the staff DB record
-       * has already been removed, so return
-       * a partial-success response.
-       */
       return res.json(
         {
           success: false,
           partialSuccess: true,
           message:
-            "Staff record and future assignments were removed, but the auth user could not be deleted.",
+            "Staff record and future assignments were removed, but the Appwrite Auth user could not be deleted.",
           error:
-            userDeleteError?.message,
+            userDeleteError?.message ||
+            String(userDeleteError),
           data: {
-            convertedToOpenShift,
+            createdOpenShifts,
             deletedAssignments,
           },
         },
@@ -366,7 +485,7 @@ export default async ({ req, res, error }) => {
       success: true,
 
       message:
-        "Staff permanently deleted and future shifts converted to open shifts.",
+        "Staff permanently deleted and future assignments converted to open shifts.",
 
       data: {
         deletedStaffId:
@@ -375,10 +494,13 @@ export default async ({ req, res, error }) => {
         deletedUserId:
           userId,
 
-        assignmentsConverted:
-          convertedToOpenShift.length,
+        futureAssignmentsFound:
+          assignments.length,
 
-        convertedToOpenShift,
+        assignmentsConverted:
+          createdOpenShifts.length,
+
+        createdOpenShifts,
 
         deletedAssignments,
       },
