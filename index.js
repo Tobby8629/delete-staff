@@ -134,7 +134,7 @@ export default async ({ req, res, error }) => {
       actorUserId,
     } = body;
 
-    if (!staffId || !userId || !actorUserId) {
+    if (!staffId || !userId ) {
       return res.json(
         {
           success: false,
@@ -329,7 +329,7 @@ export default async ({ req, res, error }) => {
                * the open shift to be created.
                */
               createdBy:
-                actorUserId,
+                actorUserId | "system",
 
               totalOpenings:
                 1,
