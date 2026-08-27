@@ -329,7 +329,7 @@ export default async ({ req, res, error }) => {
                * the open shift to be created.
                */
               createdBy:
-                actorUserId | "system",
+                actorUserId || "system",
 
               totalOpenings:
                 1,
